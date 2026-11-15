@@ -6,10 +6,12 @@ from flask_cors import CORS
 from flask_sock import Sock
 from PIL import Image
 from pydub import AudioSegment
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from model.model_omni import MiniMindOmni, RealtimeSession
-from trainer.trainer_utils import log_model_params
+from trainer.trainer_utils import log_model_params, torch_load_compat
 logging.getLogger().setLevel(logging.ERROR)
 with contextlib.redirect_stdout(io.StringIO()):
     from funasr import AutoModel
@@ -18,6 +20,7 @@ with contextlib.redirect_stdout(io.StringIO()):
 app = Flask(__name__, static_folder='.')
 CORS(app)
 sock = Sock(app)
+MODEL_DIR = os.path.join(PROJECT_ROOT, 'model')
 M = {}  # model / tokenizer / device / mimi / asr / cfg
 V = {}  # voice_name -> {ref_codes, spk_emb}
 V_builtin, V_unseen, V_manual = [], [], []
@@ -102,7 +105,7 @@ def voice_args(name):
         v = V[name]
         dev = M['device']
         rc = v['ref_codes'].unsqueeze(0).to(dev)
-        se = v['spk_emb'].half().unsqueeze(0).to(dev) if 'spk_emb' in v else None
+        se = v['spk_emb'].to(dtype=next(M['model'].parameters()).dtype).unsqueeze(0).to(dev) if 'spk_emb' in v else None
         return {'ref_codes': rc, 'spk_emb': se}
     return {}
 
@@ -123,7 +126,7 @@ def delete_manual_voice(name):
     if name not in V_manual:
         raise RuntimeError('只能删除手动克隆的音色')
     out_path = clone_voice_path()
-    saved = torch.load(out_path, map_location='cpu') if os.path.exists(out_path) else {}
+    saved = torch_load_compat(out_path, map_location='cpu') if os.path.exists(out_path) else {}
     if name in saved:
         saved.pop(name)
         torch.save(saved, out_path)
@@ -203,13 +206,16 @@ def load_main_model(model_path, model_name):
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         m = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
-        vision_encoder, vision_processor = MiniMindOmni.load_vision('../model/siglip2-base-p32-256-ve')
-        audio_encoder, audio_processor = MiniMindOmni.load_sensevoice('../model/SenseVoiceSmall')
+        model_dir = M.get('model_dir', MODEL_DIR)
+        vision_encoder, vision_processor = MiniMindOmni.load_vision(os.path.join(model_dir, 'siglip2-base-p32-256-ve'))
+        audio_encoder, audio_processor = MiniMindOmni.load_sensevoice(os.path.join(model_dir, 'SenseVoiceSmall'))
         object.__setattr__(m, 'vision_encoder', vision_encoder)
         object.__setattr__(m, 'vision_processor', vision_processor)
         object.__setattr__(m, 'audio_encoder', audio_encoder)
         object.__setattr__(m, 'audio_processor', audio_processor)
-        m = m.half().eval().to(M['device'])
+        m = m.eval().to(M['device'])
+        if torch.device(M['device']).type != 'cpu':
+            m = m.half()
         if m.audio_encoder: m.audio_encoder.to(M['device'])
         if m.vision_encoder: m.vision_encoder.to(M['device'])
         M['tokenizer'], M['model'], M['model_name'] = tok, m, model_name
@@ -273,7 +279,7 @@ def clone_voice():
         name = normalize_voice_name(d.get('name'))
         value = build_clone_voice(d['audio'])
         out_path = clone_voice_path()
-        saved = torch.load(out_path, map_location='cpu') if os.path.exists(out_path) else {}
+        saved = torch_load_compat(out_path, map_location='cpu') if os.path.exists(out_path) else {}
         saved[name] = value
         torch.save(saved, out_path)
         register_voice(name, value, group='manual')
@@ -441,9 +447,10 @@ def realtime(ws):
 
 
 def init_model(args):
-    M['cfg'] = args; M['device'] = args.device
+    model_dir = getattr(args, 'model_dir', MODEL_DIR)
+    M['cfg'] = args; M['device'] = args.device; M['model_dir'] = model_dir
     with contextlib.redirect_stdout(io.StringIO()):
-        M['asr'] = AutoModel(model='../model/SenseVoiceSmall', trust_remote_code=True, device=args.device, disable_update=True)
+        M['asr'] = AutoModel(model=os.path.join(model_dir, 'SenseVoiceSmall'), trust_remote_code=True, device=args.device, disable_update=True)
     M['models'] = scan_hf_models(args.load_from)
     if not M['models']:
         raise RuntimeError(f"未在 {os.path.abspath(args.load_from)} 找到 transformers 模型")
@@ -451,15 +458,15 @@ def init_model(args):
     load_main_model(M['models'][model_name], model_name)
     try:
         from transformers import MimiModel
-        M['mimi'] = MimiModel.from_pretrained('../model/mimi').eval().to(args.device)
-        if args.device != 'cpu': M['mimi'] = M['mimi'].half()
+        M['mimi'] = MimiModel.from_pretrained(os.path.join(model_dir, 'mimi')).eval().to(args.device)
+        if torch.device(args.device).type != 'cpu': M['mimi'] = M['mimi'].half()
         print('Mimi model loaded')
     except: M['mimi'] = None
     try:
         from modelscope.models.audio.sv.DTDNN import CAMPPlus
         M['campplus'] = CAMPPlus(feat_dim=80, embedding_size=192, growth_rate=32, bn_size=4,
                                  init_channels=128, config_str='batchnorm-relu', memory_efficient=True)
-        sd = torch.load('../model/campplus/campplus_cn_common.pt', map_location='cpu')
+        sd = torch_load_compat(os.path.join(model_dir, 'campplus', 'campplus_cn_common.pt'), map_location='cpu')
         M['campplus'].load_state_dict({k: v.float() for k, v in sd.items()})
         M['campplus'] = M['campplus'].eval().to(args.device)
         M['mel_fn'] = torchaudio.transforms.MelSpectrogram(
@@ -470,12 +477,12 @@ def init_model(args):
     except Exception as e:
         M['campplus'], M['mel_fn'] = None, None
         print(f'CAM++ load failed: {e}')
-    M['vad_path'] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'model', 'vad', 'silero_vad.onnx')
-    spk_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'model', 'speaker')
+    M['vad_path'] = os.path.join(model_dir, 'vad', 'silero_vad.onnx')
+    spk_dir = os.path.join(model_dir, 'speaker')
     for fn, group in [('voices.pt', 'builtin'), ('voices_unseen.pt', 'unseen'), (CLONE_FILE, 'manual')]:
         fp = os.path.join(spk_dir, fn)
         if os.path.exists(fp):
-            for speaker, v in torch.load(fp, map_location=args.device).items():
+            for speaker, v in torch_load_compat(fp, map_location=args.device).items():
                 if speaker not in V or fn == CLONE_FILE:
                     register_voice(speaker, v, group=group)
     if V: print(f'Loaded {len(V)} voices: builtin={sorted(V_builtin)}, unseen={sorted(V_unseen)}, manual={sorted(V_manual)}')
@@ -488,6 +495,34 @@ def init_model(args):
         if M['model'].audio_encoder: M['model'].audio_encoder(torch.zeros(1, 100, 560, device=args.device), torch.tensor([100], device=args.device))
         if M['mimi']: M['mimi'].decode(torch.zeros(1, 8, 1, dtype=torch.long, device=args.device))
     print('Warmup done!')
+
+
+def start_realtime_webui(
+    load_from='./',
+    device=None,
+    port=7860,
+    audio_chunk_frames=4,
+    audio_overlap=2,
+    max_history_turns=0,
+    model_dir=None,
+    background=False,
+):
+    """Initialize models and start the Flask/WebSocket realtime phone-mode WebUI."""
+    cfg = argparse.Namespace(
+        load_from=load_from,
+        device=device or ('cuda' if torch.cuda.is_available() else 'cpu'),
+        port=port,
+        audio_chunk_frames=audio_chunk_frames,
+        audio_overlap=audio_overlap,
+        max_history_turns=max_history_turns,
+        model_dir=model_dir or MODEL_DIR,
+    )
+    init_model(cfg)
+    if background:
+        t = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False), daemon=True)
+        t.start()
+        return t
+    app.run(host='0.0.0.0', port=port, threaded=True)
 
 
 if __name__ == '__main__':

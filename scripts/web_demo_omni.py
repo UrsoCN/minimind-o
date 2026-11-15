@@ -22,7 +22,7 @@ from pydub import AudioSegment
 from transformers import AutoTokenizer, AutoModelForCausalLM, MimiModel, TextStreamer
 from model.model_omni import MiniMindOmni, OmniConfig
 from dataset.omni_dataset import OmniDataset
-from trainer.trainer_utils import setup_seed, log_model_params
+from trainer.trainer_utils import setup_seed, log_model_params, torch_load_compat
 logging.getLogger().setLevel(logging.ERROR)
 with contextlib.redirect_stdout(io.StringIO()):
     from funasr import AutoModel
@@ -30,11 +30,19 @@ with contextlib.redirect_stdout(io.StringIO()):
 
 warnings.filterwarnings('ignore')
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 model_lock = Lock()
 
 model, tokenizer, device, mimi_model, asr_model = None, None, None, None, None
 voices_data = {}
 builtin_voices, clone_voices = set(), set()
+runtime_cfg = argparse.Namespace(
+    audio_encoder=os.path.join(PROJECT_ROOT, 'model', 'SenseVoiceSmall'),
+    vision_model=os.path.join(PROJECT_ROOT, 'model', 'siglip2-base-p32-256-ve'),
+    mimi_path=os.path.join(PROJECT_ROOT, 'model', 'mimi'),
+    open_thinking=0,
+    top_p=0.85,
+)
 
 
 def default_device():
@@ -107,13 +115,15 @@ def load_hf_model(model_path):
         [sys.modules.pop(k) for k in list(sys.modules) if 'transformers_modules' in k]
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
-        vision_encoder, vision_processor = MiniMindOmni.load_vision(args.vision_model)
-        audio_encoder, audio_processor = MiniMindOmni.load_sensevoice(args.audio_encoder)
+        vision_encoder, vision_processor = MiniMindOmni.load_vision(runtime_cfg.vision_model)
+        audio_encoder, audio_processor = MiniMindOmni.load_sensevoice(runtime_cfg.audio_encoder)
         object.__setattr__(model, 'vision_encoder', vision_encoder)
         object.__setattr__(model, 'vision_processor', vision_processor)
         object.__setattr__(model, 'audio_encoder', audio_encoder)
         object.__setattr__(model, 'audio_processor', audio_processor)
-        model = model.half().eval().to(device)
+        model = model.eval().to(device)
+        if get_device_type(device) != 'cpu':
+            model = model.half()
         if model.audio_encoder:
             model.audio_encoder.to(device)
         if model.vision_encoder:
@@ -129,9 +139,9 @@ def load_voices():
     voices_data = {}
     builtin_voices, clone_voices = set(), set()
     for name, is_builtin in [('voices.pt', True), ('voices_unseen.pt', False)]:
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'model', 'speaker', name)
+        path = os.path.join(PROJECT_ROOT, 'model', 'speaker', name)
         if os.path.exists(path):
-            data = torch.load(path, map_location=device)
+            data = torch_load_compat(path, map_location=device)
             for speaker, v in data.items():
                 if speaker not in voices_data:
                     voices_data[speaker] = v
@@ -169,10 +179,11 @@ def chat_stream(prompt, audio_input=None, image_input=None, voice_name="default"
     if voice_name != "default" and voice_name in voices_data:
         v = voices_data[voice_name]
         ref_codes = v['ref_codes'].unsqueeze(0).to(device)
-        spk_emb = v['spk_emb'].half().unsqueeze(0).to(device) if 'spk_emb' in v else None
+        model_dtype = next(model.parameters()).dtype
+        spk_emb = v['spk_emb'].to(dtype=model_dtype).unsqueeze(0).to(device) if 'spk_emb' in v else None
 
     messages = (history or []) + [{"role": "user", "content": prompt}]
-    open_thinking = bool(args.open_thinking)
+    open_thinking = bool(runtime_cfg.open_thinking)
     inputs_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, open_thinking=open_thinking)
     x = torch.tensor(tokenizer(inputs_text).data['input_ids'], dtype=torch.long, device=device)[None, ...]
 
@@ -180,7 +191,7 @@ def chat_stream(prompt, audio_input=None, image_input=None, voice_name="default"
     with torch.no_grad():
         with model_lock:
             res = model.generate(x, tokenizer.eos_token_id, max_new_tokens=max_tokens,
-                                 temperature=temperature, top_p=args.top_p, stream=True,
+                                 temperature=temperature, top_p=runtime_cfg.top_p, stream=True,
                                  return_audio_codes=True, open_thinking=open_thinking,
                                  audio_inputs=audio_inputs, audio_lens=audio_lens, pixel_values=pixel_values,
                                  ref_codes=ref_codes, spk_emb=spk_emb)
@@ -209,7 +220,7 @@ def chat_stream(prompt, audio_input=None, image_input=None, voice_name="default"
     yield None, None, asr_result[0]
 
 
-def launch_gradio(server_name="0.0.0.0", server_port=8888):
+def launch_gradio(server_name="0.0.0.0", server_port=8888, model_dict=None, current_model_name=None, share=False, inline=False):
     voice_choices = [("default", "default")]
     for s in sorted(builtin_voices): voice_choices.append((f"[内置] {s}", s))
     for s in sorted(clone_voices): voice_choices.append((f"[克隆] {s}", s))
@@ -286,7 +297,58 @@ def launch_gradio(server_name="0.0.0.0", server_port=8888):
 
         msg.submit(respond, [msg, aud, voice_dd, chatbot, model_history, turns_dd], [chatbot, audio_out, aud, model_history, audio_status])
 
-    demo.queue().launch(server_name=server_name, server_port=server_port)
+    demo.queue().launch(server_name=server_name, server_port=server_port, share=share, inline=inline)
+
+
+def start_gradio_demo(
+    load_from='./',
+    audio_encoder=None,
+    vision_model=None,
+    mimi_path=None,
+    device_name=None,
+    asr_device_name='auto',
+    mimi_device_name='auto',
+    open_thinking=0,
+    top_p=0.85,
+    port=8888,
+    share=None,
+    inline=False,
+):
+    """Initialize models and launch the MiniMind-O Gradio demo (Colab & Notebook friendly)."""
+    global device, mimi_model, asr_model, runtime_cfg
+    runtime_cfg.audio_encoder = audio_encoder or os.path.join(PROJECT_ROOT, 'model', 'SenseVoiceSmall')
+    runtime_cfg.vision_model = vision_model or os.path.join(PROJECT_ROOT, 'model', 'siglip2-base-p32-256-ve')
+    runtime_cfg.mimi_path = mimi_path or os.path.join(PROJECT_ROOT, 'model', 'mimi')
+    runtime_cfg.open_thinking = open_thinking
+    runtime_cfg.top_p = top_p
+
+    device = device_name or default_device()
+    asr_device = resolve_aux_device(asr_device_name, 'cpu' if get_device_type(device) == 'mps' else device)
+    mimi_device = resolve_aux_device(mimi_device_name, device)
+
+    model_dict = scan_hf_models(load_from)
+    if not model_dict:
+        raise RuntimeError(f"未在 {os.path.abspath(load_from)} 找到 transformers 模型，请先下载或转换权重到该目录")
+    current_model_name = list(model_dict.keys())[0]
+    load_hf_model(model_dict[current_model_name])
+
+    try:
+        mimi_model = MimiModel.from_pretrained(runtime_cfg.mimi_path).eval().to(mimi_device)
+        if get_device_type(mimi_device) != 'cpu':
+            mimi_model = mimi_model.half()
+        print(f'Mimi model loaded on {mimi_device}')
+    except Exception:
+        mimi_model = None
+        print('Mimi model not found, audio output disabled')
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        asr_model = AutoModel(model=runtime_cfg.audio_encoder, trust_remote_code=True, device=asr_device, disable_update=True)
+    load_voices()
+    print(f'Voices loaded: {list(voices_data.keys()) or "none"}')
+
+    if share is None:
+        share = ('google.colab' in sys.modules)
+    launch_gradio(server_port=port, model_dict=model_dict, current_model_name=current_model_name, share=bool(share), inline=inline)
 
 
 if __name__ == '__main__':
@@ -301,29 +363,19 @@ if __name__ == '__main__':
     parser.add_argument('--open_thinking', default=0, type=int, choices=[0, 1])
     parser.add_argument('--top_p', default=0.85, type=float)
     parser.add_argument('--port', default=8888, type=int)
+    parser.add_argument('--share', action='store_true', help='生成公网 Gradio 链接（Colab 环境默认开启）')
     args = parser.parse_args()
 
-    device = args.device
-    asr_device = resolve_aux_device(args.asr_device, 'cpu' if get_device_type(device) == 'mps' else device)
-    mimi_device = resolve_aux_device(args.mimi_device, device)
-    model_dict = scan_hf_models(args.load_from)
-    if not model_dict:
-        print(f"未在 {os.path.abspath(args.load_from)} 找到 transformers 模型")
-        exit(1)
-    current_model_name = list(model_dict.keys())[0]
-    load_hf_model(model_dict[current_model_name])
-
-    try:
-        mimi_model = MimiModel.from_pretrained(args.mimi_path).eval().to(mimi_device)
-        if get_device_type(mimi_device) != 'cpu':
-            mimi_model = mimi_model.half()
-        print(f'Mimi model loaded on {mimi_device}')
-    except Exception:
-        mimi_model = None
-        print('Mimi model not found, audio output disabled')
-
-    with contextlib.redirect_stdout(io.StringIO()):
-        asr_model = AutoModel(model=args.audio_encoder, trust_remote_code=True, device=asr_device, disable_update=True)
-    load_voices()
-    print(f'Voices loaded: {list(voices_data.keys()) or "none"}')
-    launch_gradio(server_port=args.port)
+    start_gradio_demo(
+        load_from=args.load_from,
+        audio_encoder=args.audio_encoder,
+        vision_model=args.vision_model,
+        mimi_path=args.mimi_path,
+        device_name=args.device,
+        asr_device_name=args.asr_device,
+        mimi_device_name=args.mimi_device,
+        open_thinking=args.open_thinking,
+        top_p=args.top_p,
+        port=args.port,
+        share=args.share or ('google.colab' in sys.modules),
+    )

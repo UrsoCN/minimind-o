@@ -3,88 +3,174 @@ import os
 import random
 import time
 import warnings
+from dataclasses import dataclass
+
 import torch
 import soundfile as sf
 from PIL import Image
 from pydub import AudioSegment
 from transformers import AutoTokenizer, AutoModelForCausalLM, MimiModel
+
 from model.model_omni import MiniMindOmni, OmniConfig
 from dataset.omni_dataset import OmniDataset
-from trainer.trainer_utils import setup_seed, log_model_params
+from trainer.trainer_utils import setup_seed, log_model_params, torch_load_compat
+
 warnings.filterwarnings('ignore')
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+@dataclass
+class EvalConfig:
+    """Notebook-friendly evaluation & inference configuration."""
+    load_from: str = 'model'
+    save_dir: str = 'out'
+    weight: str = 'sft_omni'
+    hidden_size: int = 768
+    num_hidden_layers: int = 8
+    use_moe: int = 0
+    max_new_tokens: int = 512
+    temperature: float = 0.7
+    top_p: float = 0.85
+    output_dir: str = './output_audio/'
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    audio_dir: str = './dataset/eval_omni/'
+    image_dir: str = './dataset/eval_omni/'
+    audio_encoder_path: str = os.path.join(PROJECT_ROOT, 'model', 'SenseVoiceSmall')
+    vision_model_path: str = os.path.join(PROJECT_ROOT, 'model', 'siglip2-base-p32-256-ve')
+    mimi_path: str = os.path.join(PROJECT_ROOT, 'model', 'mimi')
+    open_thinking: int = 0
+    decode_audio: int = 1
+    mode: str = '0'
+    prompt_lang: int = 0
 
 
 def init_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.load_from)
+    audio_encoder_path = getattr(args, 'audio_encoder_path', os.path.join(PROJECT_ROOT, 'model', 'SenseVoiceSmall'))
+    vision_model_path = getattr(args, 'vision_model_path', os.path.join(PROJECT_ROOT, 'model', 'siglip2-base-p32-256-ve'))
+    mimi_path = getattr(args, 'mimi_path', os.path.join(PROJECT_ROOT, 'model', 'mimi'))
+
+    tokenizer_path = args.load_from
+    if os.path.basename(os.path.normpath(args.load_from)) == 'model' and not os.path.exists(tokenizer_path):
+        tokenizer_path = os.path.join(PROJECT_ROOT, 'model')
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     if os.path.basename(os.path.normpath(args.load_from)) == 'model':
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
+        if not os.path.exists(ckp):
+            ckp = os.path.join(PROJECT_ROOT, args.save_dir, f'{args.weight}_{args.hidden_size}{moe_suffix}.pth')
         model = MiniMindOmni(
             OmniConfig(
                 hidden_size=args.hidden_size, 
                 num_hidden_layers=args.num_hidden_layers, 
                 use_moe=bool(args.use_moe)
             ),
-            audio_encoder_path="./model/SenseVoiceSmall",
-            vision_model_path="./model/siglip2-base-p32-256-ve"
+            audio_encoder_path=audio_encoder_path,
+            vision_model_path=vision_model_path
         )
-        model.load_state_dict(torch.load(ckp, map_location=args.device), strict=False)
+        model.load_state_dict(torch_load_compat(ckp, map_location=args.device), strict=False)
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
-        model.audio_encoder, model.audio_processor = MiniMindOmni.load_sensevoice("./model/SenseVoiceSmall")
-        model.vision_encoder, model.vision_processor = MiniMindOmni.load_vision("./model/siglip2-base-p32-256-ve")
+        model.audio_encoder, model.audio_processor = MiniMindOmni.load_sensevoice(audio_encoder_path)
+        model.vision_encoder, model.vision_processor = MiniMindOmni.load_vision(vision_model_path)
     log_model_params(model)
     if model.audio_encoder is not None: model.audio_encoder.to(args.device)
     if model.vision_encoder is not None: model.vision_encoder.to(args.device)
-    model.mimi_model = MimiModel.from_pretrained("./model/mimi").eval()
-    return model.half().eval().to(args.device), tokenizer
+    model.mimi_model = MimiModel.from_pretrained(mimi_path).eval() if os.path.exists(mimi_path) else None
+    is_cpu = torch.device(args.device).type == 'cpu'
+    model = model.eval().to(args.device)
+    if not is_cpu:
+        model = model.half()
+        if model.mimi_model is not None:
+            model.mimi_model = model.mimi_model.half()
+    if model.mimi_model is not None:
+        model.mimi_model = model.mimi_model.to(args.device)
+    return model, tokenizer
 
 
-def eval_sample(model, tokenizer, args, idx, prompt, audio_inputs, output_name, pixel_values=None, history=None, audio_lens=None, ref_codes=None, spk_emb=None):
+def eval_sample(model, tokenizer, args, idx, prompt, audio_inputs, output_name, pixel_values=None, history=None,
+                audio_lens=None, ref_codes=None, spk_emb=None, stream_print=True, save_audio=True):
     messages = (history or []) + [{"role": "user", "content": prompt}]
     inputs_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, open_thinking=bool(args.open_thinking))
     x = torch.tensor(tokenizer(inputs_text).data['input_ids'], dtype=torch.long, device=args.device)[None, ...]
 
+    if spk_emb is not None:
+        model_dtype = next(model.parameters()).dtype
+        spk_emb = spk_emb.to(device=args.device, dtype=model_dtype)
+
     audio_frames = []
+    full_answer = ""
+    audio_np = None
+    saved_audio_path = None
     with torch.no_grad():
         res_y = model.generate(x, tokenizer.eos_token_id, max_new_tokens=args.max_new_tokens,
                                temperature=args.temperature, top_p=args.top_p, stream=True,
                                return_audio_codes=True, open_thinking=bool(args.open_thinking),
                                audio_inputs=audio_inputs, audio_lens=audio_lens, pixel_values=pixel_values,
                                ref_codes=ref_codes, spk_emb=spk_emb)
-        print('📒 [Thinker]: ', end='', flush=True)
+        if stream_print:
+            print('📒 [Thinker]: ', end='', flush=True)
         history_idx = 0
         for y, audio_frame in res_y:
             if y is not None:
                 answer = tokenizer.decode(y[0].tolist(), skip_special_tokens=True)
-                if answer and answer[-1] != '�':
-                    print(answer[history_idx:], end='', flush=True)
+                if answer and answer[-1] != '\ufffd':
+                    chunk = answer[history_idx:]
+                    if stream_print:
+                        print(chunk, end='', flush=True)
+                    full_answer = answer
                     history_idx = len(answer)
             if audio_frame:
                 audio_frames.append(audio_frame)
-        print()
+        if stream_print:
+            print()
 
         if audio_frames:
-            print(f'🎹 [Talker]: {len(audio_frames)} frames', end=" ")
-            if args.decode_audio:
+            if stream_print:
+                print(f'🎹 [Talker]: {len(audio_frames)} frames', end=" ")
+            if args.decode_audio and getattr(model, 'mimi_model', None) is not None:
                 try:
                     codes = [f for f in audio_frames if f and len(f) == 8]
                     if not codes:
-                        print('⚠️  生成的Mimi codes为空，跳过保存。')
-                        return
+                        if stream_print:
+                            print('⚠️  生成的Mimi codes为空，跳过保存。')
+                        return {"text": full_answer, "audio": None, "sample_rate": 24000, "audio_path": None, "num_frames": 0}
                     mimi_codes = torch.tensor(codes, dtype=torch.long).T.unsqueeze(0).to(args.device)
                     filtered = torch.where(mimi_codes >= 2049, torch.zeros_like(mimi_codes), mimi_codes)
                     audio = model.mimi_model.decode(filtered).audio_values
-                    output_path = os.path.join(args.output_dir, output_name)
-                    wav_path = output_path.rsplit('.', 1)[0] + '.wav'
-                    sf.write(wav_path, audio.squeeze().float().cpu().numpy(), 24000)
-                    AudioSegment.from_wav(wav_path).export(output_path, format='mp3', bitrate='64k')
-                    os.remove(wav_path)
-                    print(f'| Audio decoded to: {output_path}')
+                    audio_np = audio.squeeze().float().cpu().numpy()
+                    if save_audio and output_name:
+                        os.makedirs(args.output_dir, exist_ok=True)
+                        output_path = os.path.join(args.output_dir, output_name)
+                        wav_path = output_path.rsplit('.', 1)[0] + '.wav'
+                        sf.write(wav_path, audio_np, 24000)
+                        if output_path.lower().endswith('.mp3'):
+                            try:
+                                AudioSegment.from_wav(wav_path).export(output_path, format='mp3', bitrate='64k')
+                                os.remove(wav_path)
+                                saved_audio_path = output_path
+                            except Exception:
+                                saved_audio_path = wav_path
+                        else:
+                            saved_audio_path = wav_path
+                        if stream_print:
+                            print(f'| Audio decoded to: {saved_audio_path}')
+                    elif stream_print:
+                        print('| Audio decoded in memory')
                 except Exception as e:
-                    print(f'⚠️  保存音频失败: {str(e)}')
-            else:
+                    if stream_print:
+                        print(f'⚠️  保存音频失败: {str(e)}')
+            elif stream_print:
                 print("(decode_audio=off)\n")
+
+    return {
+        "text": full_answer,
+        "audio": audio_np,
+        "sample_rate": 24000,
+        "audio_path": saved_audio_path,
+        "num_frames": len(audio_frames),
+    }
 
 
 def main():
@@ -112,6 +198,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     model, tokenizer = init_model(args)
     setup_seed(int(time.time()) % 31415926)
+    model_dtype = next(model.parameters()).dtype
 
     if '0' in modes:
         print('\n\n==================== text -> {text, audio} ====================')
@@ -195,10 +282,10 @@ def main():
         voices_pt = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model', 'speaker', 'voices_unseen.pt')
         voices = [('default', None, None)]
         if os.path.exists(voices_pt):
-            voice_data = torch.load(voices_pt, map_location=args.device)
+            voice_data = torch_load_compat(voices_pt, map_location=args.device)
             for speaker, v in sorted(voice_data.items()):
                 rc = v['ref_codes'].unsqueeze(0).to(args.device)
-                se = v['spk_emb'].half().unsqueeze(0).to(args.device) if 'spk_emb' in v else None
+                se = v['spk_emb'].to(dtype=model_dtype).unsqueeze(0).to(args.device) if 'spk_emb' in v else None
                 voices.append((speaker, rc, se))
         for speaker, rc, se in voices:
             info = f'ref_codes: {rc.shape[2]} frames, spk_emb: {"+" if se is not None else "-"}' if rc is not None else ('spk_emb only' if se is not None else 'default')
@@ -241,4 +328,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

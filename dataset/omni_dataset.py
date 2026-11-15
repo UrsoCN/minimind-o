@@ -49,11 +49,14 @@ class OmniDataset(Dataset):
                  audio_spk_token=2051,  # <|audio_spk|>
                  audio_vocab_size=2112,  # 2048 mimi codes + 64 special tokens
                  scheduled_sampling=0.05,
-                 image_token_len=64):
+                 image_token_len=64,
+                 max_samples=0):
         super().__init__()
         tables = [pa.Table.from_batches(pq.ParquetFile(p.strip()).iter_batches()) for p in data_path.split(',')]
         tables = [t.cast(pa.schema([f.with_type(pa.large_string()) if pa.types.is_string(f.type) else f for f in t.schema])) for t in tables]
         self.table = pa.concat_tables(tables, promote_options='default')
+        if max_samples and max_samples > 0:
+            self.table = self.table.slice(0, min(max_samples, len(self.table)))
         self.tokenizer = tokenizer
         self.audio_processor = audio_processor
         self.vision_processor = vision_processor
@@ -79,7 +82,14 @@ class OmniDataset(Dataset):
     @staticmethod
     def process_audio(audio_path, audio_processor):
         """加载音频并预处理成fbank，返回 (fbank (T,560), valid_len=encoder输出帧数)"""
-        wav, sr = sf.read(audio_path)
+        try:
+            wav, sr = sf.read(audio_path)
+        except Exception:
+            # Fallback for browser-recorded .webm / .m4a / .ogg or mp3 without libsndfile support
+            from pydub import AudioSegment
+            seg = AudioSegment.from_file(audio_path).set_channels(1).set_sample_width(2)
+            sr = seg.frame_rate
+            wav = np.frombuffer(seg.raw_data, dtype=np.int16).astype(np.float32) / 32768.0
         if wav.ndim > 1: wav = wav.mean(axis=1)
         if sr != 16000: wav = librosa.resample(wav.astype(float), orig_sr=sr, target_sr=16000)
         inputs = audio_processor(wav.astype(np.float32), sampling_rate=16000, return_tensors="pt", return_attention_mask=True)

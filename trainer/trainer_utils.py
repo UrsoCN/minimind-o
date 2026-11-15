@@ -63,15 +63,42 @@ def log_model_params(model, ignore_patterns=['audio_encoder', 'vision_encoder'])
     else: Logger(f'Model Params: {total:.2f}M')
 
 
+def torch_load_compat(path, map_location='cpu'):
+    """Load PyTorch checkpoints compatibly across PyTorch <2.6 and >=2.6 (weights_only default change)."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def resolve_amp_dtype(dtype='auto', device='cuda'):
+    """Resolve AMP dtype cleanly across T4 (float16), Ampere+ (bfloat16), and CPU (float32)."""
+    if 'cuda' not in str(device) or not torch.cuda.is_available():
+        return 'float32' if dtype == 'auto' else dtype
+    if dtype == 'auto':
+        major, _ = torch.cuda.get_device_capability(torch.device(device))
+        bf16_ok = False
+        if major >= 8:
+            try:
+                bf16_ok = torch.cuda.is_bf16_supported(including_emulation=False)
+            except TypeError:
+                bf16_ok = torch.cuda.is_bf16_supported()
+        return 'bfloat16' if bf16_ok else 'float16'
+    return dtype
+
+
 def init_omni_model(omni_config, from_weight='full_sft', tokenizer_path='../model', audio_encoder_path='../model/SenseVoiceSmall', vision_model_path='../model/siglip2-base-p32-256-ve', save_dir='../out', device='cuda', freeze_backbone='none', from_resume=0):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = MiniMindOmni(omni_config, audio_encoder_path=audio_encoder_path, vision_model_path=vision_model_path)
     
-    if from_weight != 'none':
+    if from_weight and from_weight != 'none':
         moe_suffix = '_moe' if omni_config.use_moe else ''
-        weight_path = f'{save_dir}/{from_weight}_{omni_config.hidden_size}{moe_suffix}.pth'
+        if from_weight.endswith('.pth') and os.path.exists(from_weight):
+            weight_path = from_weight
+        else:
+            weight_path = f'{save_dir}/{from_weight}_{omni_config.hidden_size}{moe_suffix}.pth'
         if os.path.exists(weight_path):
-            weights = torch.load(weight_path, map_location=device)
+            weights = torch_load_compat(weight_path, map_location=device)
             param_shapes = {k: v.shape for k, v in model.named_parameters()}
             incompatible = {k for k, v in weights.items() if k in param_shapes and v.shape != param_shapes[k]}
             if incompatible:
@@ -152,7 +179,7 @@ def omni_checkpoint(omni_config, weight='pretrain_omni', model=None, optimizer=N
         os.replace(resume_tmp, resume_path)
     else:  # 加载模式
         if os.path.exists(resume_path):
-            ckp_data = torch.load(resume_path, map_location='cpu')
+            ckp_data = torch_load_compat(resume_path, map_location='cpu')
             saved_ws = ckp_data.get('world_size', 1)
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
             if saved_ws != current_ws:

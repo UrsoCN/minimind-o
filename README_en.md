@@ -113,6 +113,19 @@ MiniMind-O attempts to fill this gap: speech and text are connected directly at 
 
 </details>
 
+## Google Colab / Jupyter Notebook Quick Start
+
+Interactive Jupyter Notebooks tailored for **Google Colab** (GPU runtime: **T4 / L4 / A100**) and local Jupyter are included:
+
+| Notebook | Description |
+|---|---|
+| [`MiniMind_O_Colab.ipynb`](./MiniMind_O_Colab.ipynb) | **All-in-One Colab Workflow**: environment setup, optional Google Drive persistence, HuggingFace/ModelScope downloads, SFT training & loss plots, weight conversion, inline audio/image inference, voice cloning, and WebUI launch |
+| [`notebooks/01_Train_MiniMind_O.ipynb`](./notebooks/01_Train_MiniMind_O.ipynb) | **Training & Dataset Inspection**: preview parquet rows with inline audio decoding, multi-stage SFT training, Drive resume, loss visualization, and Transformers export |
+| [`notebooks/02_Inference_and_Voice_Clone.ipynb`](./notebooks/02_Inference_and_Voice_Clone.ipynb) | **Inference & Voice Cloning**: text/audio/image chat, Colab browser microphone recording, zero-shot voice cloning from custom reference audio, and inline evaluation |
+| [`notebooks/03_WebUI_Colab.ipynb`](./notebooks/03_WebUI_Colab.ipynb) | **Colab WebUI Launcher**: Gradio demo (`share=True`) and realtime phone-mode Flask/WebSocket WebUI (`cloudflared` HTTPS/WSS tunnel) |
+
+> Colab uses [`requirements_colab.txt`](./requirements_colab.txt) to stay compatible with Colab's pre-installed CUDA PyTorch and Python 3.10–3.12+. On free-tier T4 GPUs, mixed precision automatically selects `float16`.
+
 ## Step 0 (required)
 
 ### 1' Environment

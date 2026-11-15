@@ -114,6 +114,19 @@ MiniMind-O 尝试补上已知的空位：让语音和文本在 hidden state 层�
 
 </details>
 
+## Google Colab / Jupyter Notebook 运行方式
+
+本项目已提供完整的 Jupyter Notebook 与 Google Colab 交互式工程支持，可直接上传或从 GitHub 在 Colab 中打开以下 Notebook（建议运行时选择 **GPU: T4 / L4 / A100**）：
+
+| Notebook | 用途说明 |
+|---|---|
+| [`MiniMind_O_Colab.ipynb`](./MiniMind_O_Colab.ipynb) | **全流程一体版**：环境配置、Google Drive 挂载、模型/数据下载、SFT 训练与曲线绘制、权重转换、内联音视频推理、音色克隆、WebUI 启动 |
+| [`notebooks/01_Train_MiniMind_O.ipynb`](./notebooks/01_Train_MiniMind_O.ipynb) | **训练专用**：Parquet 数据集预览（含音频解码试听）、多阶段 SFT 训练、断点续训、Loss 曲线绘制、导出 Transformers 格式 |
+| [`notebooks/02_Inference_and_Voice_Clone.ipynb`](./notebooks/02_Inference_and_Voice_Clone.ipynb) | **推理与克隆专用**：文本/语音/图像多模态对话、Colab 浏览器麦克风录音提问、自定义参考音频零样本音色克隆、批量评估 |
+| [`notebooks/03_WebUI_Colab.ipynb`](./notebooks/03_WebUI_Colab.ipynb) | **WebUI 部署专用**：一键启动 Gradio (`share=True`) 或实时语音通话 WebUI (`cloudflared` HTTPS/WSS 隧道) |
+
+> Colab 依赖清单使用 [`requirements_colab.txt`](./requirements_colab.txt)，已适配 Colab 预装的 CUDA PyTorch 与 Python 3.10–3.12+；免费版 T4 GPU 会自动选择 `float16` 混合精度。
+
 ## 第0步（必须）
 
 ### 1' 环境准备
